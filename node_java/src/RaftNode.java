@@ -26,11 +26,51 @@ public class RaftNode {
 
         // 2. Demo: Forzar este nodo a ser LIDER para probar Heartbeats
         // En la vida real, esto pasaría tras una elección.
-        System.out.println("[" + nodeId + "] Iniciando. Me autoproclamo LEADER para la demo.");
+        System.out.println("[" + nodeId + "] Iniciando. LEADER para la demo.");
         this.state = "LEADER";
         this.currentTerm = 1;
 
+        // 3. Monitor Web
+        int webPort = port + 2001; // Ej: 6000 -> 8001
+        new Thread(() -> startWebMonitor(webPort)).start();
+
         startHeartbeatSender();
+    }
+
+    private void startWebMonitor(int webPort) {
+        try (ServerSocket serverSocket = new ServerSocket(webPort)) {
+            System.out.println("[" + nodeId + "] Monitor Web escuchando en http://localhost:" + webPort);
+            while (true) {
+                try (Socket client = serverSocket.accept()) {
+                    // Leer request (ignorar contenido)
+                    BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
+                    in.readLine();
+
+                    String html = "<html><head><meta http-equiv='refresh' content='2'>" +
+                            "<style>body{font-family:monospace;background:#222;color:#0f0;padding:20px;}" +
+                            ".card{border:1px solid #444;padding:20px;border-radius:8px;max-width:600px;}" +
+                            ".LEADER{color:#f00;} .FOLLOWER{color:#0f0;}</style></head>" +
+                            "<body><div class='card'>" +
+                            "<h1>Monitor nodo: " + nodeId + "</h1>" +
+                            "<p>Estado: <span class='" + state + "'>" + state + "</span></p>" +
+                            "<p>Termino: " + currentTerm + "</p>" +
+                            "<p>Peers (Target): " + peerPort + "</p>" +
+                            "</div></body></html>";
+
+                    String response = "HTTP/1.1 200 OK\r\n" +
+                            "Content-Type: text/html\r\n" +
+                            "Content-Length: " + html.length() + "\r\n" +
+                            "Connection: close\r\n\r\n" +
+                            html;
+
+                    client.getOutputStream().write(response.getBytes());
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
     private void startServer() {
@@ -50,7 +90,7 @@ public class RaftNode {
         try (BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
             String line = in.readLine();
             if (line != null) {
-                System.out.println("[" + nodeId + "] Recibido: " + line);
+                // System.out.println("[" + nodeId + "] Recibido: " + line); // Silenciar log
                 // Aquí procesaríamos votos o latidos si fueramos Follower
             }
         } catch (Exception e) {
@@ -70,7 +110,8 @@ public class RaftNode {
     private void sendHeartbeat() {
         String json = String.format("{\"type\": \"HEARTBEAT\", \"term\": %d, \"leader_id\": \"%s\"}",
                 currentTerm, nodeId);
-        System.out.println("[" + nodeId + "] Enviando Heartbeat -> Puerto " + peerPort);
+        // System.out.println("[" + nodeId + "] Enviando Heartbeat -> Puerto " +
+        // peerPort); // Silenciar log
         sendMessage("127.0.0.1", peerPort, json);
     }
 

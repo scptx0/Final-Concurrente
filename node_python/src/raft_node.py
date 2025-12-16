@@ -125,14 +125,19 @@ class RaftNode:
     def handle_client(self, client_sock):
         with client_sock:
             try:
-                data = client_sock.recv(4096).decode('utf-8')
+                # Permitimos un buffer más grande para datos de entrenamiento
+                data = client_sock.recv(16384).decode('utf-8')
                 if not data: return
                 
-                # Manejar multiples mensajes pegados si es necesario (simple split por now)
                 for line in data.split('\n'):
                     if not line.strip(): continue
-                    msg = json.loads(line)
-                    self.process_message(msg)
+                    try:
+                        msg = json.loads(line)
+                        response = self.process_message(msg)
+                        if response:
+                            client_sock.sendall((json.dumps(response) + "\n").encode('utf-8'))
+                    except json.JSONDecodeError:
+                        print(f"Error JSON: {line}")
             except Exception as e:
                 print(f"Error recibiendo datos: {e}")
 
@@ -147,12 +152,36 @@ class RaftNode:
                 self.current_term = term
                 self.state = FOLLOWER
                 self.last_heartbeat = time.time()
-                # print(f"[{self.node_id}] Heartbeat recibido de {leader_id} (Term {term}).") 
-                # Comentamos el print para no ensuciar tanto la consola
-                pass
+                # Heartbeat handled silently
+            return None # No responder nada al heartbeat para no saturar
+
+        elif msg_type == "TRAIN":
+            data = msg.get("data", [])
+            model_id = msg.get("model_id")
+            print(f"[{self.node_id}] ENTRENAMIENTO recibido. Modelo: {model_id}, Datos: {len(data)} items")
+            
+            # --- SIMULACION DE IA (Entrenamiento) ---
+            # Calculamos la suma de cuadrados como ejemplo de "computo"
+            # En la vida real aqui iria TensorFlow/PyTorch
+            loss = sum(x * x for x in data)
+            time.sleep(0.5) # Simular tiempo de computo
+            
+            print(f"[{self.node_id}] Entrenamiento finalizado. Loss calculada: {loss}")
+            
+            # Guardamos en log para que se vea en el monitor
+            self.log.append(f"Model {model_id}: Trained on {len(data)} items. Loss={loss}")
+            
+            return {
+                "type": "TRAIN_RESULT",
+                "model_id": model_id,
+                "status": "success",
+                "computed_loss": loss,
+                "node_id": self.node_id
+            }
             
         elif msg_type == "VOTE_REQUEST":
             print(f"[{self.node_id}] Peticion de voto recibida (Aun no implementado)")
+            return None
 
     def run_election_timer(self):
         while self.running:

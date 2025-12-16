@@ -35,6 +35,39 @@ public class RaftNode {
         new Thread(() -> startWebMonitor(webPort)).start();
 
         startHeartbeatSender();
+
+        // 4. Demo: Trigger de Entrenamiento Distribuido (esperar 5s y lanzar)
+        new Thread(() -> {
+            try {
+                Thread.sleep(5000);
+                triggerTraining();
+            } catch (Exception e) {
+            }
+        }).start();
+    }
+
+    private void triggerTraining() {
+        System.out.println("=== INICIANDO ENTRENAMIENTO DISTRIBUIDO ===");
+        // Datos de ejemplo: [1, 2, 3, 4, 5]
+        String jsonTrain = "{\"type\": \"TRAIN\", \"model_id\": \"model_alpha_1\", \"data\": [1, 2, 3, 4, 5]}";
+
+        System.out.println("[" + nodeId + "] Enviando lote de datos a Python...");
+        // Usamos una conexión dedicada para esperar respuesta (Request-Reply)
+        String response = sendRequest("127.0.0.1", peerPort, jsonTrain);
+        System.out.println("[" + nodeId + "] Resultado del entrenamiento recibido: " + response);
+    }
+
+    // Nueva función auxiliar para enviar y ESPERAR respuesta
+    private String sendRequest(String host, int port, String json) {
+        try (Socket socket = new Socket(host, port);
+                PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+                BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
+
+            out.println(json);
+            return in.readLine(); // Bloquea hasta recibir respuesta
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
     }
 
     private void startWebMonitor(int webPort) {

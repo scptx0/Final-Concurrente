@@ -201,7 +201,9 @@ class RaftNode:
                     "type": "TRAIN",
                     "model_id": model_id,
                     "model_type": model_type,
-                    "term": self.current_term # Para que Java acepte si somos lider
+                    "term": self.current_term, # Para que Java acepte si somos lider
+                    "inputs": msg.get("inputs"),
+                    "targets": msg.get("targets")
                 }
                 
                 # Abrir socket con Java

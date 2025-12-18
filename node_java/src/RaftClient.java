@@ -28,7 +28,19 @@ public class RaftClient {
                 System.out.print("Tipo (PERCEPTRON/MLP): ");
                 String type = scanner.nextLine().toUpperCase();
 
-                String msg = "{\"type\": \"TRAIN\", \"model_id\": \"" + id + "\", \"model_type\": \"" + type + "\"}";
+                System.out.print("¿Usar dataset propio? (s/n): ");
+                String custom = scanner.nextLine();
+                String msg;
+                if (custom.equalsIgnoreCase("s")) {
+                    System.out.print("Inputs (ej: [[0,0],[1,1]]): ");
+                    String inputs = scanner.nextLine();
+                    System.out.print("Targets (ej: [0,1]): ");
+                    String targets = scanner.nextLine();
+                    msg = "{\"type\": \"TRAIN\", \"model_id\": \"" + id + "\", \"model_type\": \"" + type
+                            + "\", \"inputs\": \"" + inputs + "\", \"targets\": \"" + targets + "\"}";
+                } else {
+                    msg = "{\"type\": \"TRAIN\", \"model_id\": \"" + id + "\", \"model_type\": \"" + type + "\"}";
+                }
                 sendRequest(host, port, msg);
             } else if ("2".equals(choice)) {
                 System.out.print("ID del modelo: ");

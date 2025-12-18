@@ -208,34 +208,51 @@ public class RaftNode {
             String modelId = getJsonValue(json, "model_id");
             String modelType = getJsonValue(json, "model_type", "PERCEPTRON");
 
-            // 1. Distribuir trabajo (Simulado para esta fase corta, repartimos el dataset
-            // entre hilos/nodos)
-            // En un sistema real, enviaríamos mensajes TRAIN_TASK a los peers.
-            // Aquí vamos a entrenar localmente pero preparando la estructura para los
-            // peers.
-            AIModel model;
-            if ("MLP".equals(modelType)) {
-                model = new AIModel.MLP(modelId, 2, 5); // 2 inputs, 5 hidden
+            // Extraer datos personalizados o usar default
+            double[][] inputs;
+            double[] targets;
+
+            String customInputs = getJsonValue(json, "inputs");
+            String customTargets = getJsonValue(json, "targets");
+
+            if (customInputs != null && customTargets != null) {
+                String[] rows = customInputs.replace("[[", "").replace("]]", "").split("\\],\\s*\\[");
+                inputs = new double[rows.length][];
+                for (int i = 0; i < rows.length; i++) {
+                    String[] cols = rows[i].split(",");
+                    inputs[i] = new double[cols.length];
+                    for (int j = 0; j < cols.length; j++)
+                        inputs[i][j] = Double.parseDouble(cols[j].trim());
+                }
+                String[] tVals = customTargets.replace("[", "").replace("]", "").split(",");
+                targets = new double[tVals.length];
+                for (int i = 0; i < tVals.length; i++)
+                    targets[i] = Double.parseDouble(tVals[i].trim());
             } else {
-                model = new AIModel.Perceptron(modelId, 2); // 2 inputs
+                inputs = new double[][] { { 0, 0 }, { 0, 1 }, { 1, 0 }, { 1, 1 } };
+                targets = new double[] { 0, 1, 1, 1 };
             }
 
-            // Datos de ejemplo (OR Gate)
-            double[][] inputs = { { 0, 0 }, { 0, 1 }, { 1, 0 }, { 1, 1 } };
-            double[] targets = { 0, 1, 1, 1 };
+            AIModel model;
+            int inputSize = inputs[0].length;
+            if ("MLP".equals(modelType)) {
+                model = new AIModel.MLP(modelId, inputSize, 5);
+            } else {
+                model = new AIModel.Perceptron(modelId, inputSize);
+            }
 
-            System.out.println("[" + nodeId + "] Entrenando modelo " + modelId + " (" + modelType + ")...");
+            System.out.println("[" + nodeId + "] Entrenando modelo " + modelId + " (" + modelType + ") con "
+                    + inputs.length + " muestras...");
             model.train(inputs, targets, 1000, 0.1);
 
             models.put(modelId, model);
 
-            // 2. Replicar el modelo entrenado a los seguidores via Raft Log
+            // Replicar
             String weights = model.serialize();
             String syncMsg = "{\"type\": \"MODEL_SYNC\", \"model_id\": \"" + modelId + "\", \"model_type\": \""
                     + modelType + "\", \"weights\": \"" + weights + "\"}";
             log.add("TRAINED: " + modelId);
 
-            // Difundir a los peers
             for (Peer p : peers) {
                 new Thread(() -> sendMessage(p.host, p.port, syncMsg)).start();
             }

@@ -14,11 +14,13 @@ class RaftNode:
         self.node_id = node_id
         self.port = port
         self.peers = peers # Lista de tuplas (ip, port) de los otros nodos
+        self.state_file = f"raft_state_{self.node_id}.json"
         
-        # Estado persistente (Debería guardarse en disco, por ahora en memoria)
+        # Estado persistente (Ahora se carga desde disco)
         self.current_term = 0
         self.voted_for = None
         self.log = []
+        self.load_state()
 
         # Estado volátil
         self.state = FOLLOWER
@@ -27,6 +29,33 @@ class RaftNode:
         self.running = True
         self.lock = threading.Lock()
         self.votes_received = set()
+
+    def save_state(self):
+        """Guarda el estado persistente en disco."""
+        state = {
+            "current_term": self.current_term,
+            "voted_for": self.voted_for,
+            "log": self.log
+        }
+        try:
+            with open(self.state_file, "w") as f:
+                json.dump(state, f)
+        except Exception as e:
+            print(f"Error guardando estado: {e}")
+
+    def load_state(self):
+        """Carga el estado persistente desde disco."""
+        try:
+            import os
+            if os.path.exists(self.state_file):
+                with open(self.state_file, "r") as f:
+                    state = json.load(f)
+                    self.current_term = state.get("current_term", 0)
+                    self.voted_for = state.get("voted_for")
+                    self.log = state.get("log", [])
+                print(f"[{self.node_id}] Estado cargado: Term {self.current_term}, Votado por {self.voted_for}, Log {len(self.log)} items")
+        except Exception as e:
+            print(f"Error cargando estado: {e}")
 
     def start(self):
         # 1. Hilo del Servidor Raft
@@ -145,10 +174,13 @@ class RaftNode:
                 self.current_term = term
                 self.state = FOLLOWER
                 self.voted_for = None
+                self.save_state()
             
             if msg_type == "HEARTBEAT":
                 if term >= self.current_term:
-                    self.current_term = term
+                    if term > self.current_term:
+                        self.current_term = term
+                        self.save_state()
                     self.state = FOLLOWER
                     self.last_heartbeat = time.time()
                 return {"type": "HEARTBEAT_ACK", "term": self.current_term}
@@ -161,6 +193,7 @@ class RaftNode:
                     self.voted_for = candidate_id
                     self.current_term = term
                     self.last_heartbeat = time.time() # Reset timer upon voting
+                    self.save_state()
                     return {"type": "VOTE_RESPONSE", "term": self.current_term, "vote_granted": True}
                 else:
                     return {"type": "VOTE_RESPONSE", "term": self.current_term, "vote_granted": False}
@@ -183,6 +216,7 @@ class RaftNode:
                 data = msg.get("data", [])
                 loss = sum(x * x for x in data)
                 self.log.append(f"Model {model_id} loss: {loss}")
+                self.save_state()
                 return {"type": "TRAIN_RESULT", "model_id": model_id, "status": "success", "loss": loss}
 
         return None
@@ -204,6 +238,7 @@ class RaftNode:
         self.votes_received = {self.node_id}
         self.last_heartbeat = time.time()
         self.election_timeout = random.uniform(3.0, 5.0)
+        self.save_state()
 
         # Enviar VOTE_REQUEST a todos los peers
         for peer_ip, peer_port in self.peers:

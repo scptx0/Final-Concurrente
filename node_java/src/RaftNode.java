@@ -3,6 +3,8 @@ import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -37,8 +39,58 @@ public class RaftNode {
         this.nodeId = nodeId;
         this.port = port;
         this.peers = peers;
+        loadState();
         resetElectionTimeout();
         this.lastHeartbeat = System.currentTimeMillis();
+    }
+
+    private synchronized void saveState() {
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append("\"currentTerm\":").append(currentTerm).append(",");
+            sb.append("\"votedFor\":").append(votedFor == null ? "null" : "\"" + votedFor + "\"").append(",");
+            sb.append("\"log\":[");
+            for (int i = 0; i < log.size(); i++) {
+                sb.append("\"").append(log.get(i).replace("\"", "\\\"")).append("\"");
+                if (i < log.size() - 1)
+                    sb.append(",");
+            }
+            sb.append("]}");
+            Files.write(Paths.get("raft_state_" + nodeId + ".json"), sb.toString().getBytes());
+        } catch (Exception e) {
+            System.err.println("Error guardando estado: " + e.getMessage());
+        }
+    }
+
+    private void loadState() {
+        try {
+            String path = "raft_state_" + nodeId + ".json";
+            if (Files.exists(Paths.get(path))) {
+                String content = new String(Files.readAllBytes(Paths.get(path)));
+                currentTerm = Integer.parseInt(getJsonValue(content, "currentTerm", "0"));
+                votedFor = getJsonValue(content, "votedFor");
+                if ("null".equals(votedFor))
+                    votedFor = null;
+
+                // Carga de log simplificada (buscando el array [])
+                int logStart = content.indexOf("\"log\":[") + 7;
+                int logEnd = content.lastIndexOf("]");
+                if (logStart > 7 && logEnd > logStart) {
+                    String logContent = content.substring(logStart, logEnd);
+                    if (!logContent.isEmpty()) {
+                        String[] items = logContent.split("\",\"");
+                        for (String item : items) {
+                            log.add(item.replace("\"", "").replace("\\", ""));
+                        }
+                    }
+                }
+                System.out.println("[" + nodeId + "] Estado cargado: Term " + currentTerm + ", Votado por " + votedFor
+                        + ", Log " + log.size() + " items");
+            }
+        } catch (Exception e) {
+            System.err.println("Error cargando estado: " + e.getMessage());
+        }
     }
 
     private void resetElectionTimeout() {
@@ -72,11 +124,15 @@ public class RaftNode {
             currentTerm = term;
             state = "FOLLOWER";
             votedFor = null;
+            saveState();
         }
 
         if ("HEARTBEAT".equals(type)) {
             if (term >= currentTerm) {
-                currentTerm = term;
+                if (term > currentTerm) {
+                    currentTerm = term;
+                    saveState();
+                }
                 state = "FOLLOWER";
                 lastHeartbeat = System.currentTimeMillis();
             }
@@ -90,6 +146,7 @@ public class RaftNode {
                 votedFor = candidateId;
                 currentTerm = term;
                 lastHeartbeat = System.currentTimeMillis();
+                saveState();
                 if (out != null)
                     out.println("{\"type\": \"VOTE_RESPONSE\", \"term\": " + currentTerm + ", \"vote_granted\": true}");
             } else {
@@ -97,6 +154,19 @@ public class RaftNode {
                     out.println(
                             "{\"type\": \"VOTE_RESPONSE\", \"term\": " + currentTerm + ", \"vote_granted\": false}");
             }
+        } else if ("TRAIN".equals(type)) {
+            if (!"LEADER".equals(state)) {
+                if (out != null)
+                    out.println("{\"type\": \"TRAIN_RESULT\", \"status\": \"error\", \"message\": \"Not the leader\"}");
+                return;
+            }
+            String modelId = getJsonValue(json, "model_id");
+            // El calculo real vendrá en la Fase 3, por ahora mock
+            String result = "Model " + modelId + " trained at " + System.currentTimeMillis();
+            log.add(result);
+            saveState();
+            if (out != null)
+                out.println("{\"type\": \"TRAIN_RESULT\", \"model_id\": \"" + modelId + "\", \"status\": \"success\"}");
         }
     }
 
@@ -127,6 +197,7 @@ public class RaftNode {
         votesReceived.add(nodeId);
         lastHeartbeat = System.currentTimeMillis();
         resetElectionTimeout();
+        saveState();
 
         for (Peer peer : peers) {
             new Thread(() -> {

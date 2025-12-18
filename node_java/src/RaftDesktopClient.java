@@ -20,7 +20,7 @@ public class RaftDesktopClient extends JFrame {
     private JLabel resultLabel;
 
     public RaftDesktopClient() {
-        setTitle("Distributed AI Raft Client - Distributed Systems Final");
+        setTitle("IA distribuida");
         setSize(800, 600);
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setLayout(new BorderLayout());
@@ -91,7 +91,7 @@ public class RaftDesktopClient extends JFrame {
         gbc.gridy = 4;
         gbc.gridx = 0;
         gbc.gridwidth = 1;
-        p.add(new JLabel("Objetivos (Targets):"), gbc);
+        p.add(new JLabel("Salidas:"), gbc);
         targetsArea = new JTextArea("[0,1,1,1]", 2, 30);
         gbc.gridy = 5;
         gbc.gridx = 0;
@@ -101,7 +101,7 @@ public class RaftDesktopClient extends JFrame {
         gbc.gridy = 6;
         JButton trainBtn = new JButton("Iniciar Entrenamiento Distribuido");
         trainBtn.setBackground(new Color(70, 130, 180));
-        trainBtn.setForeground(Color.WHITE);
+        trainBtn.setForeground(new Color(0, 0, 0));
         trainBtn.addActionListener(e -> handleTrain());
         p.add(trainBtn, gbc);
 
@@ -124,7 +124,9 @@ public class RaftDesktopClient extends JFrame {
         gbc.gridx = 0;
         gbc.gridy = 1;
         p.add(new JLabel("Datos de entrada (ej: [1,0]):"), gbc);
+        // aumentar tamaño del campo de texto
         predDataField = new JTextField("[1, 0]");
+        predDataField.setPreferredSize(new Dimension(200, 20));
         gbc.gridx = 1;
         p.add(predDataField, gbc);
 
@@ -132,7 +134,7 @@ public class RaftDesktopClient extends JFrame {
         gbc.gridwidth = 2;
         JButton predBtn = new JButton("Solicitar Prediccion al Cluster");
         predBtn.setBackground(new Color(60, 179, 113));
-        predBtn.setForeground(Color.WHITE);
+        predBtn.setForeground(Color.BLACK);
         predBtn.addActionListener(e -> handlePredict());
         p.add(predBtn, gbc);
 

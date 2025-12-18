@@ -197,7 +197,8 @@ public class RaftNode {
             // (delegación)
             if (!"LEADER".equals(state) && term < currentTerm) {
                 if (out != null)
-                    out.println("{\"type\": \"TRAIN_RESULT\", \"status\": \"error\", \"message\": \"Not the leader\"}");
+                    out.println(
+                            "{\"type\": \"TRAIN_RESULT\", \"status\": \"error\", \"message\": \"Not the leader. Try connecting to another node in the cluster.\"}");
                 return;
             }
             String modelId = getJsonValue(json, "model_id");
@@ -232,31 +233,22 @@ public class RaftNode {
             int inputSize = inputs[0].length;
 
             if (peers.isEmpty()) {
+                // Solo este nodo, entrenar localmente
                 if ("MLP".equals(modelType))
                     finalModel = new AIModel.MLP(modelId, inputSize, 5);
                 else
                     finalModel = new AIModel.Perceptron(modelId, inputSize);
                 finalModel.train(inputs, targets, 1000, 0.1);
             } else {
-                System.out.println("[" + nodeId + "] Distribuyendo entrenamiento entre " + peers.size() + " nodos...");
-                int chunkSize = (int) Math.ceil((double) inputs.length / (peers.size() + 1));
-                List<AIModel> subModels = new ArrayList<>();
+                // LÍDER PURO: Solo coordinar, no entrenar localmente
+                System.out.println(
+                        "[" + nodeId + "] Coordinando entrenamiento distribuido entre " + peers.size() + " workers...");
+                int chunkSize = (int) Math.ceil((double) inputs.length / peers.size());
+                List<String> subWeights = new ArrayList<>();
 
-                // 1. Local
-                int localEnd = Math.min(chunkSize, inputs.length);
-                double[][] localIn = java.util.Arrays.copyOfRange(inputs, 0, localEnd);
-                double[] localTarget = java.util.Arrays.copyOfRange(targets, 0, localEnd);
-                AIModel localModel;
-                if ("MLP".equals(modelType))
-                    localModel = new AIModel.MLP(modelId, inputSize, 5);
-                else
-                    localModel = new AIModel.Perceptron(modelId, inputSize);
-                localModel.train(localIn, localTarget, 1000, 0.1);
-                subModels.add(localModel);
-
-                // 2. Peers
+                // Delegar TODO el trabajo a los peers (workers)
                 for (int i = 0; i < peers.size(); i++) {
-                    int start = (i + 1) * chunkSize;
+                    int start = i * chunkSize;
                     if (start >= inputs.length)
                         break;
                     int end = Math.min(start + chunkSize, inputs.length);
@@ -269,26 +261,49 @@ public class RaftNode {
                             "\", \"targets\": \"" + java.util.Arrays.toString(peerTarget).replace(" ", "") + "\"}";
 
                     Peer p = peers.get(i);
+                    System.out.println("[" + nodeId + "] Delegando " + (end - start) + " muestras a " + p.port);
                     String resp = sendAndReceive(p.host, p.port, taskMsg);
                     if (resp != null) {
                         String w = getJsonValue(resp, "weights");
-                        AIModel pm;
-                        if ("MLP".equals(modelType))
-                            pm = new AIModel.MLP(modelId, inputSize, 5);
-                        else
-                            pm = new AIModel.Perceptron(modelId, inputSize);
-                        pm.deserialize(w);
-                        subModels.add(pm);
+                        if (w != null) {
+                            subWeights.add(w);
+                            System.out.println("[" + nodeId + "] Worker " + p.port + " completó su tarea");
+                        }
                     }
                 }
 
-                // 3. Average
-                if ("MLP".equals(modelType)) {
-                    finalModel = AIModel.MLP.average(modelId,
-                            subModels.stream().map(m -> (AIModel.MLP) m).toArray(AIModel.MLP[]::new));
+                // Promediar los resultados de los workers
+                if (subWeights.isEmpty()) {
+                    System.out.println("[" + nodeId + "] ERROR: Ningún worker respondió");
+                    if (out != null)
+                        out.println(
+                                "{\"type\": \"TRAIN_RESULT\", \"status\": \"error\", \"message\": \"No workers available\"}");
+                    return;
+                }
+
+                if (subWeights.size() == 1) {
+                    if ("MLP".equals(modelType))
+                        finalModel = new AIModel.MLP(modelId, inputSize, 5);
+                    else
+                        finalModel = new AIModel.Perceptron(modelId, inputSize);
+                    finalModel.deserialize(subWeights.get(0));
                 } else {
-                    finalModel = AIModel.Perceptron.average(modelId,
-                            subModels.stream().map(m -> (AIModel.Perceptron) m).toArray(AIModel.Perceptron[]::new));
+                    System.out.println("[" + nodeId + "] Promediando " + subWeights.size() + " modelos...");
+                    if ("MLP".equals(modelType)) {
+                        AIModel.MLP[] mlps = new AIModel.MLP[subWeights.size()];
+                        for (int i = 0; i < subWeights.size(); i++) {
+                            mlps[i] = new AIModel.MLP(modelId + "_" + i, inputSize, 5);
+                            mlps[i].deserialize(subWeights.get(i));
+                        }
+                        finalModel = AIModel.MLP.average(modelId, mlps);
+                    } else {
+                        AIModel.Perceptron[] perceptrons = new AIModel.Perceptron[subWeights.size()];
+                        for (int i = 0; i < subWeights.size(); i++) {
+                            perceptrons[i] = new AIModel.Perceptron(modelId + "_" + i, inputSize);
+                            perceptrons[i].deserialize(subWeights.get(i));
+                        }
+                        finalModel = AIModel.Perceptron.average(modelId, perceptrons);
+                    }
                 }
             }
 
@@ -358,7 +373,34 @@ public class RaftNode {
             return;
         } else if ("PREDICT".equals(type)) {
             String modelId = getJsonValue(json, "model_id");
-            System.out.println("[" + nodeId + "] PREDICCION solicitada para: " + modelId);
+            String dataStr = getJsonValue(json, "data");
+
+            // Si soy LIDER, delegar a un worker
+            if ("LEADER".equals(state) && !peers.isEmpty()) {
+                System.out.println("[" + nodeId + "] Delegando predicción de " + modelId + " a workers...");
+                String predMsg = "{\"type\": \"PREDICT\", \"model_id\": \"" + modelId + "\", \"data\": \"" + dataStr
+                        + "\"}";
+
+                // Intentar con cada worker hasta que uno responda
+                for (Peer p : peers) {
+                    String resp = sendAndReceive(p.host, p.port, predMsg);
+                    if (resp != null && !resp.contains("error")) {
+                        System.out.println("[" + nodeId + "] Predicción completada por worker " + p.port);
+                        if (out != null)
+                            out.println(resp);
+                        return;
+                    }
+                }
+
+                System.out.println("[" + nodeId + "] Ningún worker pudo procesar la predicción");
+                if (out != null)
+                    out.println(
+                            "{\"type\": \"PREDICT_RESULT\", \"status\": \"error\", \"message\": \"No workers available\"}");
+                return;
+            }
+
+            // Si soy FOLLOWER/WORKER, ejecutar la predicción localmente
+            System.out.println("[" + nodeId + "] Ejecutando predicción para: " + modelId);
             AIModel model = models.get(modelId);
             if (model == null) {
                 System.out.println("[" + nodeId + "] Error: Modelo " + modelId + " no encontrado.");
@@ -368,7 +410,6 @@ public class RaftNode {
                 return;
             }
             // Parsear inputs
-            String dataStr = getJsonValue(json, "data");
             System.out.println("[" + nodeId + "] Inputs recibidos: " + dataStr);
             String[] parts = dataStr.replace("[", "").replace("]", "").split(",");
             double[] inputs = new double[parts.length];
@@ -658,7 +699,13 @@ public class RaftNode {
                                 .append("LEADER".equals(state) ? "Latido enviado hace: " : "Ultimo latido hace: ")
                                 .append(String.format("%.2f", (System.currentTimeMillis() - lastHeartbeat) / 1000.0))
                                 .append("s</p>")
-                                .append("<hr><h3>Modelos Entrenados:</h3><ul>");
+                                .append("<hr><h3>Peers:</h3><ul>");
+
+                        for (Peer p : peers) {
+                            sb.append("<li>").append(p.host).append(":").append(p.port).append("</li>");
+                        }
+
+                        sb.append("</ul><hr><h3>Modelos Entrenados:</h3><ul>");
 
                         for (String mid : models.keySet()) {
                             sb.append("<li><b>").append(mid).append("</b> (").append(models.get(mid).getType())

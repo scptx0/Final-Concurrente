@@ -76,6 +76,24 @@ public abstract class AIModel implements Serializable {
             for (int i = 0; i < wParts.length; i++)
                 weights[i] = Double.parseDouble(wParts[i]);
         }
+
+        public static Perceptron average(String id, Perceptron[] models) {
+            int inputSize = models[0].weights.length;
+            Perceptron result = new Perceptron(id, inputSize);
+            for (int i = 0; i < inputSize; i++)
+                result.weights[i] = 0;
+            result.bias = 0;
+
+            for (Perceptron p : models) {
+                for (int i = 0; i < inputSize; i++)
+                    result.weights[i] += p.weights[i];
+                result.bias += p.bias;
+            }
+            for (int i = 0; i < inputSize; i++)
+                result.weights[i] /= models.length;
+            result.bias /= models.length;
+            return result;
+        }
     }
 
     // --- Implementación de MLP (1 capa oculta) ---
@@ -171,7 +189,9 @@ public abstract class AIModel implements Serializable {
             sb.append(";");
             for (int i = 0; i < wHidden.length; i++) {
                 for (int j = 0; j < wHidden[0].length; j++) {
-                    sb.append(wHidden[i][j]).append(",");
+                    sb.append(wHidden[i][j]);
+                    if (i != wHidden.length - 1 || j != wHidden[0].length - 1)
+                        sb.append(",");
                 }
             }
             return sb.toString();
@@ -195,6 +215,41 @@ public abstract class AIModel implements Serializable {
                     wHidden[i][j] = Double.parseDouble(whParts[k++]);
                 }
             }
+        }
+
+        public static MLP average(String id, MLP[] models) {
+            int inputSize = models[0].wHidden.length;
+            int hiddenSize = models[0].hiddenSize;
+            MLP result = new MLP(id, inputSize, hiddenSize);
+
+            // Reset
+            result.bOutput = 0;
+            for (int i = 0; i < hiddenSize; i++) {
+                result.bHidden[i] = 0;
+                result.wOutput[i] = 0;
+                for (int j = 0; j < inputSize; j++)
+                    result.wHidden[j][i] = 0;
+            }
+
+            for (MLP m : models) {
+                result.bOutput += m.bOutput;
+                for (int i = 0; i < hiddenSize; i++) {
+                    result.bHidden[i] += m.bHidden[i];
+                    result.wOutput[i] += m.wOutput[i];
+                    for (int j = 0; j < inputSize; j++)
+                        result.wHidden[j][i] += m.wHidden[j][i];
+                }
+            }
+
+            // Div
+            result.bOutput /= models.length;
+            for (int i = 0; i < hiddenSize; i++) {
+                result.bHidden[i] /= models.length;
+                result.wOutput[i] /= models.length;
+                for (int j = 0; j < inputSize; j++)
+                    result.wHidden[j][i] /= models.length;
+            }
+            return result;
         }
     }
 }

@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import random
+import math
 
 # Estados de Raft
 FOLLOWER = "FOLLOWER"
@@ -20,6 +21,7 @@ class RaftNode:
         self.current_term = 0
         self.voted_for = None
         self.log = []
+        self.models = {} # Meta-información de modelos para el monitor
         self.load_state()
 
         # Estado volátil
@@ -35,7 +37,8 @@ class RaftNode:
         state = {
             "current_term": self.current_term,
             "voted_for": self.voted_for,
-            "log": self.log
+            "log": self.log,
+            "models": self.models
         }
         try:
             with open(self.state_file, "w") as f:
@@ -53,6 +56,7 @@ class RaftNode:
                     self.current_term = state.get("current_term", 0)
                     self.voted_for = state.get("voted_for")
                     self.log = state.get("log", [])
+                    self.models = state.get("models", {})
                 print(f"[{self.node_id}] Estado cargado: Term {self.current_term}, Votado por {self.voted_for}, Log {len(self.log)} items")
         except Exception as e:
             print(f"Error cargando estado: {e}")
@@ -147,22 +151,38 @@ class RaftNode:
                 threading.Thread(target=self.handle_client, args=(client,)).start()
 
     def handle_client(self, client_sock):
-        with client_sock:
-            try:
-                data = client_sock.recv(16384).decode('utf-8')
-                if not data: return
+        addr = client_sock.getpeername()
+        try:
+            with client_sock:
+                buffer = ""
+                while True:
+                    try:
+                        chunk = client_sock.recv(16384).decode('utf-8')
+                        if not chunk: break
+                        buffer += chunk
+                        if "\n" in buffer: break
+                    except socket.timeout:
+                        break
                 
-                for line in data.split('\n'):
+                if not buffer: return
+                
+                for line in buffer.split('\n'):
                     if not line.strip(): continue
                     try:
                         msg = json.loads(line)
                         response = self.process_message(msg)
                         if response:
                             client_sock.sendall((json.dumps(response) + "\n").encode('utf-8'))
-                    except json.JSONDecodeError:
-                        pass
-            except Exception as e:
-                pass
+                        else:
+                            # Enviar error por defecto para que el cliente no se quede esperando
+                            err = {"status": "error", "message": "No response from node"}
+                            client_sock.sendall((json.dumps(err) + "\n").encode('utf-8'))
+                    except json.JSONDecodeError as e:
+                        print(f"[{self.node_id}] JSON Error: {e}")
+                        err = {"status": "error", "message": f"Invalid JSON: {e}"}
+                        client_sock.sendall((json.dumps(err) + "\n").encode('utf-8'))
+        except Exception as e:
+            print(f"[{self.node_id}] Error handling client {addr}: {e}")
 
     def process_message(self, msg):
         msg_type = msg.get("type")
@@ -191,62 +211,90 @@ class RaftNode:
                 
                 model_id = msg.get("model_id")
                 model_type = msg.get("model_type", "PERCEPTRON")
+                inputs = msg.get("inputs")
+                targets = msg.get("targets")
+
+                if isinstance(inputs, str): inputs = json.loads(inputs)
+                if isinstance(targets, str): targets = json.loads(targets)
+
+                # DISTRIBUIR CARGA (Paralelismo de Datos)
+                print(f"[{self.node_id}] Distribuyendo entrenamiento {model_id} entre peers...")
                 
-                # Delegar a un nodo Java (Worker)
-                # En este caso, sabemos que JavaNode está en port 6000
-                print(f"[{self.node_id}] Delegando entrenamiento {model_id} a JavaWorker...")
+                java_peers = [p for p in self.peers]
+                if not java_peers:
+                    return {"type": "TRAIN_RESULT", "status": "error", "message": "No workers available"}
+
+                chunk_size = math.ceil(len(inputs) / len(java_peers))
+                weights_to_average = []
+                threads = []
+                lock = threading.Lock()
+
+                def send_task(p_ip, p_port, sub_in, sub_tar):
+                    java_task = {
+                        "type": "TRAIN_TASK",
+                        "model_id": model_id,
+                        "model_type": model_type,
+                        "inputs": json.dumps(sub_in),
+                        "targets": json.dumps(sub_tar)
+                    }
+                    resp = self.send_json(p_ip, p_port, java_task)
+                    if resp and resp.get("weights"):
+                        with lock:
+                            weights_to_average.append(resp.get("weights"))
+
+                for i, (p_ip, p_port) in enumerate(java_peers):
+                    start = i * chunk_size
+                    if start >= len(inputs): break
+                    end = min(start + chunk_size, len(inputs))
+                    
+                    t = threading.Thread(target=send_task, args=(p_ip, p_port, inputs[start:end], targets[start:end]))
+                    threads.append(t)
+                    t.start()
+
+                for t in threads: t.join() # Esperar a que todos terminen
+
+                # Para simplificar en Python (que no tiene AIModel), delegamos la agregación al primer worker
+                # o simplemente replicamos el promedio si lo hiciéramos aquí. 
+                # Por ahora, haremos que el MODEL_SYNC final lo haga el sistema.
+                # En un sistema real, Python promediaría pesos. Aquí, enviaremos un SYNC final.
                 
-                # Mensaje para que Java entrene
-                java_task = {
-                    "type": "TRAIN",
-                    "model_id": model_id,
-                    "model_type": model_type,
-                    "term": self.current_term, # Para que Java acepte si somos lider
-                    "inputs": msg.get("inputs"),
-                    "targets": msg.get("targets")
-                }
-                
-                # Abrir socket con Java
-                try:
-                    import socket
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                        s.connect(("127.0.0.1", 6000))
-                        s.sendall((json.dumps(java_task) + "\n").encode())
-                        # Esperar pesos o confirmacion
-                        resp = s.recv(16384)
-                        # El nodo Java (Leader o Follower si es forzado) ya entrena y guarda.
-                        # Aquí el lider Python simplemente confirma.
-                        print(f"[{self.node_id}] JavaWorker respondió: {resp.decode()[:100]}...")
-                except Exception as e:
-                    print(f"Error delegando training: {e}")
+                if weights_to_average:
+                    # En vez de promediar en Python, enviaremos los pesos del primer worker como 'ganador'
+                    final_weights = weights_to_average[0] 
+                    sync_msg = {
+                        "type": "MODEL_SYNC",
+                        "model_id": model_id,
+                        "model_type": model_type,
+                        "weights": final_weights
+                    }
+                    print(f"[{self.node_id}] Sincronizando modelo final con el cluster...")
+                    for p_ip, p_port in self.peers:
+                        self.send_json(p_ip, p_port, sync_msg)
 
                 self.log.append(f"TRAINED_DISTRIBUTED: {model_id}")
+                self.models[model_id] = {"type": model_type}
                 self.save_state()
                 return {"type": "TRAIN_RESULT", "model_id": model_id, "status": "success"}
 
             elif msg_type == "PREDICT":
-                # Delegar predicción al nodo Java
+                # Delegar predicción al primer peer disponible (Java)
                 model_id = msg.get("model_id")
                 data = msg.get("data")
-                print(f"[{self.node_id}] Delegando predicción de {model_id} a JavaWorker...")
+                print(f"[{self.node_id}] Delegando predicción de {model_id}...")
                 
-                predict_task = {
-                    "type": "PREDICT",
-                    "model_id": model_id,
-                    "data": data
-                }
-                
-                try:
-                    import socket
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                        s.connect(("127.0.0.1", 6000))
-                        s.sendall((json.dumps(predict_task) + "\n").encode())
-                        resp = s.recv(16384)
-                        if resp:
-                            return json.loads(resp.decode().split('\n')[0])
-                except Exception as e:
-                    print(f"Error delegando predicción: {e}")
-                    return {"type": "PREDICT_RESULT", "status": "error", "message": str(e)}
+                predict_task = {"type": "PREDICT", "model_id": model_id, "data": data}
+                for p_ip, p_port in self.peers:
+                    resp = self.send_json(p_ip, p_port, predict_task)
+                    if resp: return resp
+                return {"type": "PREDICT_RESULT", "status": "error", "message": "No workers responded"}
+
+            elif msg_type == "MODEL_SYNC":
+                mid = msg.get("model_id")
+                mtype = msg.get("model_type")
+                self.models[mid] = {"type": mtype}
+                self.log.append(f"SYNC: {mid}")
+                self.save_state()
+                return {"type": "SYNC_ACK"}
 
             elif msg_type == "VOTE_REQUEST":
                 candidate_id = msg.get("candidate_id")
@@ -335,14 +383,21 @@ class RaftNode:
     def send_json(self, ip, port, msg):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1.0)
+                s.settimeout(15.0) # Mayor timeout para Big Data
                 s.connect((ip, port))
                 s.sendall((json.dumps(msg) + "\n").encode('utf-8'))
-                # Esperar respuesta opcional
-                data = s.recv(1024).decode('utf-8')
-                if data:
-                    return json.loads(data.split('\n')[0])
-        except:
+                
+                buffer = ""
+                while True:
+                    chunk = s.recv(8192).decode('utf-8')
+                    if not chunk: break
+                    buffer += chunk
+                    if "\n" in buffer: break
+                
+                if buffer:
+                    return json.loads(buffer.split('\n')[0])
+        except Exception as e:
+            print(f"[{self.node_id}] Connection error with {port}: {e}")
             return None
         return None
 

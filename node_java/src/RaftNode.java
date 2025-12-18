@@ -5,14 +5,9 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.stream.*;
+import java.util.concurrent.*;
 
 public class RaftNode {
     private String nodeId;
@@ -233,6 +228,101 @@ public class RaftNode {
                 targets = new double[] { 0, 1, 1, 1 };
             }
 
+            AIModel finalModel;
+            int inputSize = inputs[0].length;
+
+            if (peers.isEmpty()) {
+                if ("MLP".equals(modelType))
+                    finalModel = new AIModel.MLP(modelId, inputSize, 5);
+                else
+                    finalModel = new AIModel.Perceptron(modelId, inputSize);
+                finalModel.train(inputs, targets, 1000, 0.1);
+            } else {
+                System.out.println("[" + nodeId + "] Distribuyendo entrenamiento entre " + peers.size() + " nodos...");
+                int chunkSize = (int) Math.ceil((double) inputs.length / (peers.size() + 1));
+                List<AIModel> subModels = new ArrayList<>();
+
+                // 1. Local
+                int localEnd = Math.min(chunkSize, inputs.length);
+                double[][] localIn = java.util.Arrays.copyOfRange(inputs, 0, localEnd);
+                double[] localTarget = java.util.Arrays.copyOfRange(targets, 0, localEnd);
+                AIModel localModel;
+                if ("MLP".equals(modelType))
+                    localModel = new AIModel.MLP(modelId, inputSize, 5);
+                else
+                    localModel = new AIModel.Perceptron(modelId, inputSize);
+                localModel.train(localIn, localTarget, 1000, 0.1);
+                subModels.add(localModel);
+
+                // 2. Peers
+                for (int i = 0; i < peers.size(); i++) {
+                    int start = (i + 1) * chunkSize;
+                    if (start >= inputs.length)
+                        break;
+                    int end = Math.min(start + chunkSize, inputs.length);
+                    double[][] peerIn = java.util.Arrays.copyOfRange(inputs, start, end);
+                    double[] peerTarget = java.util.Arrays.copyOfRange(targets, start, end);
+
+                    String taskMsg = "{\"type\": \"TRAIN_TASK\", \"model_id\": \"" + modelId +
+                            "\", \"model_type\": \"" + modelType +
+                            "\", \"inputs\": \"" + java.util.Arrays.deepToString(peerIn).replace(" ", "") +
+                            "\", \"targets\": \"" + java.util.Arrays.toString(peerTarget).replace(" ", "") + "\"}";
+
+                    Peer p = peers.get(i);
+                    String resp = sendAndReceive(p.host, p.port, taskMsg);
+                    if (resp != null) {
+                        String w = getJsonValue(resp, "weights");
+                        AIModel pm;
+                        if ("MLP".equals(modelType))
+                            pm = new AIModel.MLP(modelId, inputSize, 5);
+                        else
+                            pm = new AIModel.Perceptron(modelId, inputSize);
+                        pm.deserialize(w);
+                        subModels.add(pm);
+                    }
+                }
+
+                // 3. Average
+                if ("MLP".equals(modelType)) {
+                    finalModel = AIModel.MLP.average(modelId,
+                            subModels.stream().map(m -> (AIModel.MLP) m).toArray(AIModel.MLP[]::new));
+                } else {
+                    finalModel = AIModel.Perceptron.average(modelId,
+                            subModels.stream().map(m -> (AIModel.Perceptron) m).toArray(AIModel.Perceptron[]::new));
+                }
+            }
+
+            models.put(modelId, finalModel);
+            String weights = finalModel.serialize();
+            String syncMsg = "{\"type\": \"MODEL_SYNC\", \"model_id\": \"" + modelId +
+                    "\", \"model_type\": \"" + modelType + "\", \"weights\": \"" + weights + "\"}";
+            log.add("TRAINED_DISTRIBUTED: " + modelId);
+            for (Peer p : peers)
+                new Thread(() -> sendMessage(p.host, p.port, syncMsg)).start();
+            saveState();
+            if (out != null)
+                out.println("{\"type\": \"TRAIN_RESULT\", \"model_id\": \"" + modelId + "\", \"status\": \"success\"}");
+        } else if ("TRAIN_TASK".equals(type)) {
+            // Un seguidor recibe una parte del entrenamiento
+            String modelId = getJsonValue(json, "model_id");
+            String modelType = getJsonValue(json, "model_type", "PERCEPTRON");
+            String customInputs = getJsonValue(json, "inputs");
+            String customTargets = getJsonValue(json, "targets");
+
+            // Parsear inputs/targets (copiado de TRAIN)
+            String[] rows = customInputs.replace("[[", "").replace("]]", "").split("\\],\\s*\\[");
+            double[][] inputs = new double[rows.length][];
+            for (int i = 0; i < rows.length; i++) {
+                String[] cols = rows[i].split(",");
+                inputs[i] = new double[cols.length];
+                for (int j = 0; j < cols.length; j++)
+                    inputs[i][j] = Double.parseDouble(cols[j].trim());
+            }
+            String[] tVals = customTargets.replace("[", "").replace("]", "").split(",");
+            double[] targets = new double[tVals.length];
+            for (int i = 0; i < tVals.length; i++)
+                targets[i] = Double.parseDouble(tVals[i].trim());
+
             AIModel model;
             int inputSize = inputs[0].length;
             if ("MLP".equals(modelType)) {
@@ -241,28 +331,13 @@ public class RaftNode {
                 model = new AIModel.Perceptron(modelId, inputSize);
             }
 
-            System.out.println("[" + nodeId + "] Entrenando modelo " + modelId + " (" + modelType + ") con "
-                    + inputs.length + " muestras...");
             model.train(inputs, targets, 1000, 0.1);
 
-            models.put(modelId, model);
-
-            // Replicar
-            String weights = model.serialize();
-            String syncMsg = "{\"type\": \"MODEL_SYNC\", \"model_id\": \"" + modelId + "\", \"model_type\": \""
-                    + modelType + "\", \"weights\": \"" + weights + "\"}";
-            log.add("TRAINED: " + modelId);
-
-            for (Peer p : peers) {
-                new Thread(() -> sendMessage(p.host, p.port, syncMsg)).start();
+            if (out != null) {
+                out.println("{\"type\": \"TRAIN_TASK_RESULT\", \"model_id\": \"" + modelId +
+                        "\", \"weights\": \"" + model.serialize() + "\"}");
             }
-
-            saveState();
-            if (out != null)
-                out.println("{\"type\": \"TRAIN_RESULT\", \"model_id\": \"" + modelId + "\", \"status\": \"success\"}");
-        } else if ("TRAIN_TASK".equals(type)) {
-            // Un seguidor recibe una parte del entrenamiento
-            // TODO: Implementar entrenamiento parcial y retorno de gradientes/pesos
+            return;
         } else if ("PREDICT".equals(type)) {
             String modelId = getJsonValue(json, "model_id");
             System.out.println("[" + nodeId + "] PREDICCION solicitada para: " + modelId);
@@ -288,21 +363,42 @@ public class RaftNode {
                 out.println("{\"type\": \"PREDICT_RESULT\", \"model_id\": \"" + modelId + "\", \"prediction\": "
                         + prediction + "}");
         } else if ("MODEL_SYNC".equals(type)) {
-            // Mensaje interno de Raft para sincronizar pesos (reducido para el log)
             String modelId = getJsonValue(json, "model_id");
             String modelType = getJsonValue(json, "model_type");
             String weights = getJsonValue(json, "weights");
 
+            System.out.println(
+                    "[" + nodeId + "] Recibiendo sincronizacion de modelo: " + modelId + " (" + modelType + ")");
+
             AIModel m;
-            if ("MLP".equals(modelType)) {
-                m = new AIModel.MLP(modelId, weights.split(",").length / 5, 5); // Simplificación de arquitectura
-            } else {
-                m = new AIModel.Perceptron(modelId, weights.split(",").length);
+            try {
+                if ("MLP".equals(modelType)) {
+                    // hiddenSize;bOutput;bHidden...
+                    int hiddenSize = Integer.parseInt(weights.split(";")[0]);
+                    // Necesitamos inputSize. Lo inferimos de la parte final de los pesos.
+                    // wHidden está al final.
+                    String[] parts = weights.split(";");
+                    int totalWHidden = parts[4].split(",").length;
+                    int inputSize = totalWHidden / hiddenSize;
+                    m = new AIModel.MLP(modelId, inputSize, hiddenSize);
+                } else {
+                    // bias;w1,w2...
+                    int inputSize = weights.split(";")[1].split(",").length;
+                    m = new AIModel.Perceptron(modelId, inputSize);
+                }
+                m.deserialize(weights);
+                models.put(modelId, m);
+                System.out.println("[" + nodeId + "] Modelo " + modelId + " sincronizado correctamente.");
+                log.add("REPLICATED_MODEL: " + modelId);
+                saveState();
+                if (out != null)
+                    out.println("{\"type\": \"MODEL_SYNC_ACK\", \"status\": \"success\"}");
+            } catch (Exception e) {
+                System.out.println("[" + nodeId + "] Error sincronizando modelo " + modelId + ": " + e.getMessage());
+                if (out != null)
+                    out.println("{\"type\": \"MODEL_SYNC_ACK\", \"status\": \"error\", \"message\": \"" + e.getMessage()
+                            + "\"}");
             }
-            m.deserialize(weights);
-            models.put(modelId, m);
-            log.add("REPLICATED_MODEL: " + modelId);
-            saveState();
         }
     }
 
@@ -420,27 +516,53 @@ public class RaftNode {
         int index = json.indexOf(search);
         if (index == -1)
             return defaultValue;
+
         int start = index + search.length();
-        while (start < json.length() && (json.charAt(start) == ' ' || json.charAt(start) == ':'
-                || json.charAt(start) == '"' || json.charAt(start) == '{')) {
+        // Saltar espacios y dos puntos
+        while (start < json.length() && (json.charAt(start) == ' ' || json.charAt(start) == ':')) {
             start++;
         }
-        int end = start;
-        int brackets = 0;
-        while (end < json.length()) {
-            char c = json.charAt(end);
-            if (c == '[')
-                brackets++;
-            if (c == ']')
-                brackets--;
 
-            if (brackets == 0 && (c == '"' || (c == ',' && !json.substring(start, end).contains("[")) || c == '}')) {
-                break;
+        if (start >= json.length())
+            return defaultValue;
+
+        char firstChar = json.charAt(start);
+        int end = start;
+
+        if (firstChar == '"') {
+            // Es un string: leer hasta la siguiente comilla no escapada
+            start++; // saltar comilla inicial
+            end = start;
+            while (end < json.length() && json.charAt(end) != '"') {
+                if (json.charAt(end) == '\\')
+                    end++; // saltar escape
+                end++;
             }
-            end++;
+        } else if (firstChar == '[' || firstChar == '{') {
+            // Es array u objeto: leer hasta balancear corchetes/llaves
+            int balance = 0;
+            char open = firstChar;
+            char close = (open == '[') ? ']' : '}';
+            while (end < json.length()) {
+                if (json.charAt(end) == open)
+                    balance++;
+                if (json.charAt(end) == close)
+                    balance--;
+                end++;
+                if (balance == 0)
+                    break;
+            }
+        } else {
+            // Es un número o boolean: leer hasta coma o fin de objeto
+            while (end < json.length() && json.charAt(end) != ',' && json.charAt(end) != '}'
+                    && json.charAt(end) != ']') {
+                end++;
+            }
         }
-        String val = json.substring(start, end).replace("\"", "").trim();
-        return val.isEmpty() ? defaultValue : val;
+
+        if (start >= end)
+            return defaultValue;
+        return json.substring(start, end).trim();
     }
 
     private void startWebMonitor(int webPort) {

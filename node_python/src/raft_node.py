@@ -230,17 +230,24 @@ class RaftNode:
                 lock = threading.Lock()
 
                 def send_task(p_ip, p_port, sub_in, sub_tar):
-                    java_task = {
-                        "type": "TRAIN_TASK",
-                        "model_id": model_id,
-                        "model_type": model_type,
-                        "inputs": json.dumps(sub_in),
-                        "targets": json.dumps(sub_tar)
-                    }
-                    resp = self.send_json(p_ip, p_port, java_task)
-                    if resp and resp.get("weights"):
-                        with lock:
-                            weights_to_average.append(resp.get("weights"))
+                    try:
+                        print(f"[{self.node_id}] Enviando tarea a worker {p_port} con {len(sub_in)} muestras...")
+                        java_task = {
+                            "type": "TRAIN_TASK",
+                            "model_id": model_id,
+                            "model_type": model_type,
+                            "inputs": json.dumps(sub_in),
+                            "targets": json.dumps(sub_tar)
+                        }
+                        resp = self.send_json(p_ip, p_port, java_task)
+                        if resp and resp.get("weights"):
+                            with lock:
+                                weights_to_average.append(resp.get("weights"))
+                            print(f"[{self.node_id}] Worker {p_port} completo: recibidos pesos")
+                        else:
+                            print(f"[{self.node_id}] Worker {p_port} no retorno pesos validos: {resp}")
+                    except Exception as e:
+                        print(f"[{self.node_id}] Error en worker {p_port}: {e}")
 
                 for i, (p_ip, p_port) in enumerate(java_peers):
                     start = i * chunk_size
@@ -252,15 +259,32 @@ class RaftNode:
                     t.start()
 
                 for t in threads: t.join() # Esperar a que todos terminen
-
-                # Para simplificar en Python (que no tiene AIModel), delegamos la agregación al primer worker
-                # o simplemente replicamos el promedio si lo hiciéramos aquí. 
-                # Por ahora, haremos que el MODEL_SYNC final lo haga el sistema.
-                # En un sistema real, Python promediaría pesos. Aquí, enviaremos un SYNC final.
                 
+                print(f"[{self.node_id}] Todos los workers completados. Pesos recibidos: {len(weights_to_average)}")
+
                 if weights_to_average:
-                    # En vez de promediar en Python, enviaremos los pesos del primer worker como 'ganador'
-                    final_weights = weights_to_average[0] 
+                    if len(weights_to_average) == 1:
+                        # Solo un worker, usar sus pesos directamente
+                        final_weights = weights_to_average[0]
+                    else:
+                        # Múltiples workers: delegar el promediado al primer worker
+                        print(f"[{self.node_id}] Solicitando promediado de {len(weights_to_average)} modelos...")
+                        avg_request = {
+                            "type": "AVERAGE_MODELS",
+                            "model_id": model_id,
+                            "model_type": model_type,
+                            "weights_list": weights_to_average
+                        }
+                        # Enviar al primer peer para que haga el promediado
+                        p_ip, p_port = self.peers[0]
+                        avg_resp = self.send_json(p_ip, p_port, avg_request)
+                        if avg_resp and avg_resp.get("averaged_weights"):
+                            final_weights = avg_resp.get("averaged_weights")
+                            print(f"[{self.node_id}] Promediado completado")
+                        else:
+                            print(f"[{self.node_id}] Error en promediado, usando primer modelo")
+                            final_weights = weights_to_average[0]
+                    
                     sync_msg = {
                         "type": "MODEL_SYNC",
                         "model_id": model_id,

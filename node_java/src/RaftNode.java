@@ -309,33 +309,51 @@ public class RaftNode {
             String customInputs = getJsonValue(json, "inputs");
             String customTargets = getJsonValue(json, "targets");
 
-            // Parsear inputs/targets (copiado de TRAIN)
-            String[] rows = customInputs.replace("[[", "").replace("]]", "").split("\\],\\s*\\[");
-            double[][] inputs = new double[rows.length][];
-            for (int i = 0; i < rows.length; i++) {
-                String[] cols = rows[i].split(",");
-                inputs[i] = new double[cols.length];
-                for (int j = 0; j < cols.length; j++)
-                    inputs[i][j] = Double.parseDouble(cols[j].trim());
-            }
-            String[] tVals = customTargets.replace("[", "").replace("]", "").split(",");
-            double[] targets = new double[tVals.length];
-            for (int i = 0; i < tVals.length; i++)
-                targets[i] = Double.parseDouble(tVals[i].trim());
+            System.out.println("[" + nodeId + "] TRAIN_TASK recibido para: " + modelId + " (" + modelType + ")");
 
-            AIModel model;
-            int inputSize = inputs[0].length;
-            if ("MLP".equals(modelType)) {
-                model = new AIModel.MLP(modelId, inputSize, 5);
-            } else {
-                model = new AIModel.Perceptron(modelId, inputSize);
-            }
+            try {
+                // Parsear inputs/targets
+                String[] rows = customInputs.replace("[[", "").replace("]]", "").split("\\],\\s*\\[");
+                double[][] inputs = new double[rows.length][];
+                for (int i = 0; i < rows.length; i++) {
+                    String[] cols = rows[i].split(",");
+                    inputs[i] = new double[cols.length];
+                    for (int j = 0; j < cols.length; j++)
+                        inputs[i][j] = Double.parseDouble(cols[j].trim());
+                }
+                String[] tVals = customTargets.replace("[", "").replace("]", "").split(",");
+                double[] targets = new double[tVals.length];
+                for (int i = 0; i < tVals.length; i++)
+                    targets[i] = Double.parseDouble(tVals[i].trim());
 
-            model.train(inputs, targets, 1000, 0.1);
+                System.out.println("[" + nodeId + "] Entrenando con " + inputs.length + " muestras...");
 
-            if (out != null) {
-                out.println("{\"type\": \"TRAIN_TASK_RESULT\", \"model_id\": \"" + modelId +
-                        "\", \"weights\": \"" + model.serialize() + "\"}");
+                AIModel model;
+                int inputSize = inputs[0].length;
+                if ("MLP".equals(modelType)) {
+                    model = new AIModel.MLP(modelId, inputSize, 5);
+                } else {
+                    model = new AIModel.Perceptron(modelId, inputSize);
+                }
+
+                model.train(inputs, targets, 1000, 0.1);
+
+                String weights = model.serialize();
+                // Escapar caracteres especiales para JSON
+                weights = weights.replace("\\", "\\\\").replace("\"", "\\\"");
+                System.out.println("[" + nodeId + "] Entrenamiento completado. Enviando pesos...");
+
+                if (out != null) {
+                    out.println("{\"type\": \"TRAIN_TASK_RESULT\", \"model_id\": \"" + modelId +
+                            "\", \"weights\": \"" + weights + "\"}");
+                }
+            } catch (Exception e) {
+                System.out.println("[" + nodeId + "] ERROR en TRAIN_TASK: " + e.getMessage());
+                e.printStackTrace();
+                if (out != null) {
+                    out.println("{\"type\": \"TRAIN_TASK_RESULT\", \"status\": \"error\", \"message\": \""
+                            + e.getMessage() + "\"}");
+                }
             }
             return;
         } else if ("PREDICT".equals(type)) {
@@ -398,6 +416,57 @@ public class RaftNode {
                 if (out != null)
                     out.println("{\"type\": \"MODEL_SYNC_ACK\", \"status\": \"error\", \"message\": \"" + e.getMessage()
                             + "\"}");
+            }
+        } else if ("AVERAGE_MODELS".equals(type)) {
+            // Promediar múltiples modelos
+            String modelId = getJsonValue(json, "model_id");
+            String modelType = getJsonValue(json, "model_type");
+            String weightsList = getJsonValue(json, "weights_list");
+
+            System.out.println("[" + nodeId + "] Promediando modelos para: " + modelId);
+
+            try {
+                // Parsear la lista de pesos (formato: ["peso1", "peso2", ...])
+                String[] weightsArray = weightsList.replace("[\"", "").replace("\"]", "").split("\",\\s*\"");
+
+                if ("MLP".equals(modelType)) {
+                    AIModel.MLP[] mlps = new AIModel.MLP[weightsArray.length];
+                    for (int i = 0; i < weightsArray.length; i++) {
+                        int hiddenSize = Integer.parseInt(weightsArray[i].split(";")[0]);
+                        String[] parts = weightsArray[i].split(";");
+                        int totalWHidden = parts[4].split(",").length;
+                        int inputSize = totalWHidden / hiddenSize;
+                        mlps[i] = new AIModel.MLP(modelId + "_" + i, inputSize, hiddenSize);
+                        mlps[i].deserialize(weightsArray[i]);
+                    }
+                    AIModel.MLP averaged = AIModel.MLP.average(modelId, mlps);
+                    String avgWeights = averaged.serialize();
+                    avgWeights = avgWeights.replace("\\", "\\\\").replace("\"", "\\\"");
+                    if (out != null) {
+                        out.println("{\"type\": \"AVERAGE_RESULT\", \"averaged_weights\": \"" + avgWeights + "\"}");
+                    }
+                } else {
+                    AIModel.Perceptron[] perceptrons = new AIModel.Perceptron[weightsArray.length];
+                    for (int i = 0; i < weightsArray.length; i++) {
+                        int inputSize = weightsArray[i].split(";")[1].split(",").length;
+                        perceptrons[i] = new AIModel.Perceptron(modelId + "_" + i, inputSize);
+                        perceptrons[i].deserialize(weightsArray[i]);
+                    }
+                    AIModel.Perceptron averaged = AIModel.Perceptron.average(modelId, perceptrons);
+                    String avgWeights = averaged.serialize();
+                    avgWeights = avgWeights.replace("\\", "\\\\").replace("\"", "\\\"");
+                    if (out != null) {
+                        out.println("{\"type\": \"AVERAGE_RESULT\", \"averaged_weights\": \"" + avgWeights + "\"}");
+                    }
+                }
+                System.out.println("[" + nodeId + "] Promediado completado");
+            } catch (Exception e) {
+                System.out.println("[" + nodeId + "] Error promediando: " + e.getMessage());
+                e.printStackTrace();
+                if (out != null) {
+                    out.println("{\"type\": \"AVERAGE_RESULT\", \"status\": \"error\", \"message\": \"" + e.getMessage()
+                            + "\"}");
+                }
             }
         }
     }

@@ -6,7 +6,9 @@ import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -24,6 +26,7 @@ public class RaftNode {
     private boolean running = true;
     private List<String> votesReceived = new ArrayList<>();
     private List<String> log = new ArrayList<>();
+    private Map<String, AIModel> models = new HashMap<>();
 
     private static class Peer {
         String host;
@@ -56,7 +59,16 @@ public class RaftNode {
                 if (i < log.size() - 1)
                     sb.append(",");
             }
-            sb.append("]}");
+            sb.append("],\"models\":{");
+            int count = 0;
+            for (String mid : models.keySet()) {
+                AIModel m = models.get(mid);
+                sb.append("\"").append(mid).append("\":{")
+                        .append("\"type\":\"").append(m.getType()).append("\",")
+                        .append("\"weights\":\"").append(m.serialize()).append("\"}")
+                        .append(++count < models.size() ? "," : "");
+            }
+            sb.append("}}");
             Files.write(Paths.get("raft_state_" + nodeId + ".json"), sb.toString().getBytes());
         } catch (Exception e) {
             System.err.println("Error guardando estado: " + e.getMessage());
@@ -87,6 +99,37 @@ public class RaftNode {
                 }
                 System.out.println("[" + nodeId + "] Estado cargado: Term " + currentTerm + ", Votado por " + votedFor
                         + ", Log " + log.size() + " items");
+
+                // Carga de modelos
+                int modelsStart = content.indexOf("\"models\":{");
+                if (modelsStart != -1) {
+                    // Muy simplificado: buscamos los bloques de modelos
+                    // En un sistema real usaríamos Jackson/Gson
+                    String modelsSection = content.substring(modelsStart + 9, content.length() - 1);
+                    if (modelsSection.length() > 2) {
+                        String[] modelEntries = modelsSection.split("\\},\"");
+                        for (String entry : modelEntries) {
+                            try {
+                                String cleanEntry = entry.startsWith("{") ? entry.substring(1) : entry;
+                                String mId = cleanEntry.split("\":\\{")[0].replace("\"", "");
+                                String mType = getJsonValue(entry, "type");
+                                String mWeights = getJsonValue(entry, "weights");
+
+                                AIModel model;
+                                if ("MLP".equals(mType)) {
+                                    model = new AIModel.MLP(mId, 2, 5);
+                                } else {
+                                    model = new AIModel.Perceptron(mId, 2);
+                                }
+                                model.deserialize(mWeights);
+                                synchronized (this) {
+                                    models.put(mId, model);
+                                }
+                            } catch (Exception ex) {
+                            }
+                        }
+                    }
+                }
             }
         } catch (Exception e) {
             System.err.println("Error cargando estado: " + e.getMessage());
@@ -155,18 +198,94 @@ public class RaftNode {
                             "{\"type\": \"VOTE_RESPONSE\", \"term\": " + currentTerm + ", \"vote_granted\": false}");
             }
         } else if ("TRAIN".equals(type)) {
-            if (!"LEADER".equals(state)) {
+            // Permitir entrenamiento si somos LIDER O si recibimos una orden del LIDER
+            // (delegación)
+            if (!"LEADER".equals(state) && term < currentTerm) {
                 if (out != null)
                     out.println("{\"type\": \"TRAIN_RESULT\", \"status\": \"error\", \"message\": \"Not the leader\"}");
                 return;
             }
             String modelId = getJsonValue(json, "model_id");
-            // El calculo real vendrá en la Fase 3, por ahora mock
-            String result = "Model " + modelId + " trained at " + System.currentTimeMillis();
-            log.add(result);
+            String modelType = getJsonValue(json, "model_type", "PERCEPTRON");
+
+            // 1. Distribuir trabajo (Simulado para esta fase corta, repartimos el dataset
+            // entre hilos/nodos)
+            // En un sistema real, enviaríamos mensajes TRAIN_TASK a los peers.
+            // Aquí vamos a entrenar localmente pero preparando la estructura para los
+            // peers.
+            AIModel model;
+            if ("MLP".equals(modelType)) {
+                model = new AIModel.MLP(modelId, 2, 5); // 2 inputs, 5 hidden
+            } else {
+                model = new AIModel.Perceptron(modelId, 2); // 2 inputs
+            }
+
+            // Datos de ejemplo (OR Gate)
+            double[][] inputs = { { 0, 0 }, { 0, 1 }, { 1, 0 }, { 1, 1 } };
+            double[] targets = { 0, 1, 1, 1 };
+
+            System.out.println("[" + nodeId + "] Entrenando modelo " + modelId + " (" + modelType + ")...");
+            model.train(inputs, targets, 1000, 0.1);
+
+            models.put(modelId, model);
+
+            // 2. Replicar el modelo entrenado a los seguidores via Raft Log
+            String weights = model.serialize();
+            String syncMsg = "{\"type\": \"MODEL_SYNC\", \"model_id\": \"" + modelId + "\", \"model_type\": \""
+                    + modelType + "\", \"weights\": \"" + weights + "\"}";
+            log.add("TRAINED: " + modelId);
+
+            // Difundir a los peers
+            for (Peer p : peers) {
+                new Thread(() -> sendMessage(p.host, p.port, syncMsg)).start();
+            }
+
             saveState();
             if (out != null)
                 out.println("{\"type\": \"TRAIN_RESULT\", \"model_id\": \"" + modelId + "\", \"status\": \"success\"}");
+        } else if ("TRAIN_TASK".equals(type)) {
+            // Un seguidor recibe una parte del entrenamiento
+            // TODO: Implementar entrenamiento parcial y retorno de gradientes/pesos
+        } else if ("PREDICT".equals(type)) {
+            String modelId = getJsonValue(json, "model_id");
+            System.out.println("[" + nodeId + "] PREDICCION solicitada para: " + modelId);
+            AIModel model = models.get(modelId);
+            if (model == null) {
+                System.out.println("[" + nodeId + "] Error: Modelo " + modelId + " no encontrado.");
+                if (out != null)
+                    out.println(
+                            "{\"type\": \"PREDICT_RESULT\", \"status\": \"error\", \"message\": \"Model not found\"}");
+                return;
+            }
+            // Parsear inputs
+            String dataStr = getJsonValue(json, "data");
+            System.out.println("[" + nodeId + "] Inputs recibidos: " + dataStr);
+            String[] parts = dataStr.replace("[", "").replace("]", "").split(",");
+            double[] inputs = new double[parts.length];
+            for (int i = 0; i < parts.length; i++)
+                inputs[i] = Double.parseDouble(parts[i].trim());
+
+            double prediction = model.predict(inputs);
+            System.out.println("[" + nodeId + "] Resultado prediccion: " + prediction);
+            if (out != null)
+                out.println("{\"type\": \"PREDICT_RESULT\", \"model_id\": \"" + modelId + "\", \"prediction\": "
+                        + prediction + "}");
+        } else if ("MODEL_SYNC".equals(type)) {
+            // Mensaje interno de Raft para sincronizar pesos (reducido para el log)
+            String modelId = getJsonValue(json, "model_id");
+            String modelType = getJsonValue(json, "model_type");
+            String weights = getJsonValue(json, "weights");
+
+            AIModel m;
+            if ("MLP".equals(modelType)) {
+                m = new AIModel.MLP(modelId, weights.split(",").length / 5, 5); // Simplificación de arquitectura
+            } else {
+                m = new AIModel.Perceptron(modelId, weights.split(",").length);
+            }
+            m.deserialize(weights);
+            models.put(modelId, m);
+            log.add("REPLICATED_MODEL: " + modelId);
+            saveState();
         }
     }
 
@@ -290,8 +409,17 @@ public class RaftNode {
             start++;
         }
         int end = start;
-        while (end < json.length() && json.charAt(end) != '"' && json.charAt(end) != ',' && json.charAt(end) != '}'
-                && json.charAt(end) != ' ') {
+        int brackets = 0;
+        while (end < json.length()) {
+            char c = json.charAt(end);
+            if (c == '[')
+                brackets++;
+            if (c == ']')
+                brackets--;
+
+            if (brackets == 0 && (c == '"' || (c == ',' && !json.substring(start, end).contains("[")) || c == '}')) {
+                break;
+            }
             end++;
         }
         String val = json.substring(start, end).replace("\"", "").trim();
@@ -305,30 +433,44 @@ public class RaftNode {
                     BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
                     in.readLine();
 
-                    String html;
+                    final String htmlOutput;
                     synchronized (this) {
-                        html = "<html><head><meta http-equiv='refresh' content='2'>" +
-                                "<style>body{font-family:monospace;background:#222;color:#0f0;padding:20px;}" +
-                                ".card{border:1px solid #444;padding:20px;border-radius:8px;max-width:600px;}" +
-                                ".LEADER{color:#f00;} .FOLLOWER{color:#0f0;}.CANDIDATE{color:#ff0;}</style></head>" +
-                                "<body><div class='card'>" +
-                                "<h1>Monitor nodo: " + nodeId + "</h1>" +
-                                "<p>Estado: <span class='" + state + "'>" + state + "</span></p>" +
-                                "<p>Termino: " + currentTerm + "</p>" +
-                                "<p>Voto por: " + votedFor + "</p>" +
-                                "<p>" + ("LEADER".equals(state) ? "Latido enviado hace: " : "Ultimo latido hace: ") +
-                                String.format("%.2f", (System.currentTimeMillis() - lastHeartbeat) / 1000.0) + "s</p>" +
-                                "<p>Log size: " + log.size() + "</p>" +
-                                "</div></body></html>";
+                        StringBuilder sb = new StringBuilder();
+                        sb.append("<html><head><meta http-equiv='refresh' content='2'>")
+                                .append("<style>body{font-family:monospace;background:#222;color:#0f0;padding:20px;}")
+                                .append(".card{border:1px solid #444;padding:20px;border-radius:8px;max-width:600px;}")
+                                .append(".LEADER{color:#f00;} .FOLLOWER{color:#0f0;}.CANDIDATE{color:#ff0;}</style></head>")
+                                .append("<body><div class='card'>")
+                                .append("<h1>Monitor nodo: ").append(nodeId).append("</h1>")
+                                .append("<p>Estado: <span class='").append(state).append("'>").append(state)
+                                .append("</span></p>")
+                                .append("<p>Termino: ").append(currentTerm).append("</p>")
+                                .append("<p>Voto por: ").append(votedFor).append("</p>")
+                                .append("<p>")
+                                .append("LEADER".equals(state) ? "Latido enviado hace: " : "Ultimo latido hace: ")
+                                .append(String.format("%.2f", (System.currentTimeMillis() - lastHeartbeat) / 1000.0))
+                                .append("s</p>")
+                                .append("<hr><h3>Modelos Entrenados:</h3><ul>");
+
+                        for (String mid : models.keySet()) {
+                            sb.append("<li><b>").append(mid).append("</b> (").append(models.get(mid).getType())
+                                    .append(")</li>");
+                        }
+
+                        sb.append("</ul><hr><p>Log size: ").append(log.size()).append("</p></div></body></html>");
+                        htmlOutput = sb.toString();
                     }
 
-                    String response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: " + html.length()
-                            + "\r\n\r\n" + html;
+                    String response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: "
+                            + htmlOutput.length()
+                            + "\r\n\r\n" + htmlOutput;
                     client.getOutputStream().write(response.getBytes());
                 } catch (Exception e) {
+                    // Ignorar errores de conexión individual
                 }
             }
         } catch (Exception e) {
+            e.printStackTrace();
         }
     }
 

@@ -185,6 +185,67 @@ class RaftNode:
                     self.last_heartbeat = time.time()
                 return {"type": "HEARTBEAT_ACK", "term": self.current_term}
 
+            elif msg_type == "TRAIN":
+                if self.state != LEADER:
+                    return {"type": "TRAIN_RESULT", "status": "error", "message": "Not the leader"}
+                
+                model_id = msg.get("model_id")
+                model_type = msg.get("model_type", "PERCEPTRON")
+                
+                # Delegar a un nodo Java (Worker)
+                # En este caso, sabemos que JavaNode está en port 6000
+                print(f"[{self.node_id}] Delegando entrenamiento {model_id} a JavaWorker...")
+                
+                # Mensaje para que Java entrene
+                java_task = {
+                    "type": "TRAIN",
+                    "model_id": model_id,
+                    "model_type": model_type,
+                    "term": self.current_term # Para que Java acepte si somos lider
+                }
+                
+                # Abrir socket con Java
+                try:
+                    import socket
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.connect(("127.0.0.1", 6000))
+                        s.sendall((json.dumps(java_task) + "\n").encode())
+                        # Esperar pesos o confirmacion
+                        resp = s.recv(16384)
+                        # El nodo Java (Leader o Follower si es forzado) ya entrena y guarda.
+                        # Aquí el lider Python simplemente confirma.
+                        print(f"[{self.node_id}] JavaWorker respondió: {resp.decode()[:100]}...")
+                except Exception as e:
+                    print(f"Error delegando training: {e}")
+
+                self.log.append(f"TRAINED_DISTRIBUTED: {model_id}")
+                self.save_state()
+                return {"type": "TRAIN_RESULT", "model_id": model_id, "status": "success"}
+
+            elif msg_type == "PREDICT":
+                # Delegar predicción al nodo Java
+                model_id = msg.get("model_id")
+                data = msg.get("data")
+                print(f"[{self.node_id}] Delegando predicción de {model_id} a JavaWorker...")
+                
+                predict_task = {
+                    "type": "PREDICT",
+                    "model_id": model_id,
+                    "data": data
+                }
+                
+                try:
+                    import socket
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.connect(("127.0.0.1", 6000))
+                        s.sendall((json.dumps(predict_task) + "\n").encode())
+                        resp = s.recv(16384)
+                        if resp:
+                            return json.loads(resp.decode().split('\n')[0])
+                except Exception as e:
+                    print(f"Error delegando predicción: {e}")
+                    return {"type": "PREDICT_RESULT", "status": "error", "message": str(e)}
+
             elif msg_type == "VOTE_REQUEST":
                 candidate_id = msg.get("candidate_id")
                 can_vote = (self.voted_for is None or self.voted_for == candidate_id) and (term >= self.current_term)
@@ -206,18 +267,6 @@ class RaftNode:
                         # Nota: msg no trae id por defecto en la respuesta, lo asumimos del flujo o lo agregamos
                         pass 
                 return None
-
-            elif msg_type == "TRAIN":
-                if self.state != LEADER:
-                    return {"type": "TRAIN_RESULT", "status": "error", "message": "Not the leader"}
-                
-                # Mock de entrenamiento (Fase 3 se encargará de esto)
-                model_id = msg.get("model_id")
-                data = msg.get("data", [])
-                loss = sum(x * x for x in data)
-                self.log.append(f"Model {model_id} loss: {loss}")
-                self.save_state()
-                return {"type": "TRAIN_RESULT", "model_id": model_id, "status": "success", "loss": loss}
 
         return None
 
